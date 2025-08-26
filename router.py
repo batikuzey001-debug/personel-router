@@ -2,8 +2,10 @@ import os, json
 from typing import Dict
 import gspread
 
-from sheets import (get_gspread_client, open_sheet_by_id,
-                    ensure_column, read_headers)
+from sheets import (
+    get_gspread_client, open_sheet_by_id, ensure_column, read_headers,
+    safe_get_values, safe_update_cell, safe_append_row
+)
 from persons import ensure_person_list, find_or_create_person, ensure_person_page
 from utils import now_str
 from state import get_last_row, set_last_row
@@ -38,21 +40,22 @@ def ensure_processed_cols(ws: gspread.Worksheet):
     return pcol, rcol
 
 def iter_rows(ws: gspread.Worksheet, start_row: int):
-    """start_row'dan itibaren satırları (headere göre) yield eder.
-       Sadece son WINDOW satırı okunur."""
-    header_vals = ws.get_values("1:1")
+    """start_row'dan itibaren, sadece son WINDOW satırı getir."""
+    header_vals = safe_get_values(ws, "1:1")
     header = [h.strip() for h in header_vals[0]] if header_vals else []
     if not header:
         return
-    last = ws.row_count  # tahsisli satır sayısı (çoğu zaman yeter)
-    start = max(2, min(start_row, last))  # en az satır-2 (data başlangıcı)
-    # pencere uygula:
-    start = max(2, max(start, last - WINDOW + 1))
-    rng = f"{start}:{last}"
-    rows = ws.get_values(rng)  # sadece bu aralığı çek
-    for i, row in enumerate(rows, start=start):
+    # son WINDOW satır
+    last_rows = safe_get_values(ws, f"2:100000")
+    total = len(last_rows) + 1  # +1 çünkü 2. satırdan başladı
+    start = max(2, total - WINDOW + 1, start_row)
+    rng = f"{start}:{start + (len(last_rows) - (start-2))}"
+    rows = safe_get_values(ws, rng)
+    row_index = start
+    for row in rows:
         rec = {header[j]: (row[j] if j < len(row) else "") for j in range(len(header))}
-        rec["_row"] = i
+        rec["_row"] = row_index
+        row_index += 1
         yield rec, header
 
 def route_once() -> Dict[str, int]:
@@ -82,7 +85,6 @@ def route_once() -> Dict[str, int]:
         for rec, header in iter_rows(ws, last_done + 1):
             max_row_seen = max(max_row_seen, rec["_row"])
 
-            # Zaten işlenmişse atla
             if str(rec.get("ProcessedAt","")).strip():
                 continue
 
@@ -92,8 +94,8 @@ def route_once() -> Dict[str, int]:
 
             pid, durum = find_or_create_person(dst, kisi)
             if durum.lower().startswith("pasif"):
-                ws.update_cell(rec["_row"], pcol, now_str())
-                ws.update_cell(rec["_row"], rcol, "PASIF")
+                safe_update_cell(ws, rec["_row"], pcol, now_str())
+                safe_update_cell(ws, rec["_row"], rcol, "PASIF")
                 processed += 1
                 continue
 
@@ -102,7 +104,7 @@ def route_once() -> Dict[str, int]:
             zaman = pick_time(rec)
             raw = {k:v for k,v in rec.items() if k!="_row"}
 
-            # Kişi sayfasına ekle
+            # kişi sayfasına ekle
             hdr = read_headers(pws)
             row = [None]*len(hdr)
             def setv(col, val):
@@ -112,14 +114,13 @@ def route_once() -> Dict[str, int]:
             setv("Zaman", zaman)
             setv("AlanlarJSON", json.dumps(raw, ensure_ascii=False))
             setv("ProcessedAt", now_str())
-            pws.append_row(row, value_input_option="USER_ENTERED")
+            safe_append_row(pws, row)
 
-            # Kaynak satırı işaretle
-            ws.update_cell(rec["_row"], pcol, now_str())
-            ws.update_cell(rec["_row"], rcol, pid)
+            # kaynağı işaretle
+            safe_update_cell(ws, rec["_row"], pcol, now_str())
+            safe_update_cell(ws, rec["_row"], rcol, pid)
             processed += 1
 
-        # State'i güncelle
         set_last_row(dst, name, max_row_seen)
         results[name] = processed
 

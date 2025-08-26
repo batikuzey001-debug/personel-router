@@ -38,10 +38,50 @@ def safe_append_row(ws: gspread.Worksheet, row_vals):
 # -------------------------------------------------------------------------
 
 def get_gspread_client() -> gspread.Client:
+    """
+    1) SVC_JSON varsa ve geçerli JSON ise onu kullanır.
+    2) Değilse, tek tek ENV değişkenlerinden servis hesabı JSON'unu oluşturur.
+       private_key hem \\n hem de çok satırlı gelse otomatik düzeltilir.
+    """
     svc_json = os.environ.get("SVC_JSON")
-    if not svc_json:
-        raise RuntimeError("SVC_JSON env değişkeni yok.")
-    info = json.loads(svc_json)
+    info = None
+
+    # 1) SVC_JSON'u dene
+    if svc_json:
+        try:
+            info = json.loads(svc_json)
+        except json.JSONDecodeError:
+            info = None
+
+    # 2) Tek tek ENV değişkenlerini toplayıp JSON üret
+    if info is None:
+        def env(*names, default=""):
+            for n in names:
+                v = os.environ.get(n)
+                if v:
+                    return v
+            return default
+
+        pk = env("private_key", "PRIVATE_KEY")
+        # Çok satırlı geldiyse normalleştir:
+        if "\\n" in pk:
+            pk = pk.replace("\\n", "\n")
+
+        info = {
+            "type": env("type", "TYPE", default="service_account"),
+            "project_id": env("project_id", "PROJECT_ID"),
+            "private_key_id": env("private_key_id", "PRIVATE_KEY_ID"),
+            "private_key": pk,
+            "client_email": env("client_email", "CLIENT_EMAIL"),
+            "client_id": env("client_id", "CLIENT_ID"),
+            "auth_uri": env("auth_uri", "AUTH_URI", default="https://accounts.google.com/o/oauth2/auth"),
+            "token_uri": env("token_uri", "TOKEN_URI", default="https://oauth2.googleapis.com/token"),
+            "auth_provider_x509_cert_url": env("auth_provider_x509_cert_url", "AUTH_PROVIDER_X509_CERT_URL",
+                                               default="https://www.googleapis.com/oauth2/v1/certs"),
+            "client_x509_cert_url": env("client_x509_cert_url", "CLIENT_X509_CERT_URL"),
+            "universe_domain": env("universe_domain", "UNIVERSE_DOMAIN", default="googleapis.com"),
+        }
+
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
@@ -82,7 +122,7 @@ def ensure_column(ws: gspread.Worksheet, col_name: str) -> int:
     return len(hdr)
 
 def get_all_records_with_row(ws: gspread.Worksheet) -> Tuple[List[Dict], List[str]]:
-    """PersonelListesi için kullanıyoruz (küçük tablo)."""
+    """PersonelListesi için: 2. satırdan aşağıyı okur, boş satırları atlar."""
     hdr = read_headers(ws)
     if not hdr:
         return [], []

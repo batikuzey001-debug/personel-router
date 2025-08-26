@@ -3,12 +3,13 @@ from typing import Dict
 import gspread
 
 from sheets import (get_gspread_client, open_sheet_by_id,
-                    ensure_column, get_all_records_with_row, read_headers)
+                    ensure_column, read_headers)
 from persons import ensure_person_list, find_or_create_person, ensure_person_page
-from utils import now_str, normalize_name
+from utils import now_str
+from state import get_last_row, set_last_row
 
-# İşlenecek sayfa isimleri
 LOG_SHEETS = ["MesaiLog","BonusLog","FinansLog"]
+WINDOW = 200  # sadece son 200 satırı oku
 
 def pick_time(rec: Dict) -> str:
     for k in ["LogTs","TalepTs","CloseTs","BildirimTarih","FirstTs","Ts","Zaman"]:
@@ -16,8 +17,8 @@ def pick_time(rec: Dict) -> str:
     return ""
 
 def extract_name(sheet_name: str, rec: Dict) -> str:
-    if sheet_name == "MesaiLog":
-        if rec.get("Kisi"): return str(rec["Kisi"]).strip()
+    if sheet_name == "MesaiLog" and rec.get("Kisi"):
+        return str(rec["Kisi"]).strip()
     for k in ["ClosedByFull","FirstByFull"]:
         if rec.get(k):
             val = str(rec[k])
@@ -36,21 +37,23 @@ def ensure_processed_cols(ws: gspread.Worksheet):
     rcol = ensure_column(ws, "RoutedTo")
     return pcol, rcol
 
-def append_to_person(pws: gspread.Worksheet, source_key: str, zaman: str, kaynak: str, raw: Dict):
-    hdr = read_headers(pws)
-    row = [None]*len(hdr)
-
-    def setv(name, val):
-        if name in hdr:
-            row[hdr.index(name)] = val
-
-    setv("Kaynak", kaynak)
-    setv("SourceKey", source_key)
-    setv("Zaman", zaman)
-    setv("AlanlarJSON", json.dumps(raw, ensure_ascii=False))
-    setv("ProcessedAt", now_str())
-
-    pws.append_row(row, value_input_option="USER_ENTERED")
+def iter_rows(ws: gspread.Worksheet, start_row: int):
+    """start_row'dan itibaren satırları (headere göre) yield eder.
+       Sadece son WINDOW satırı okunur."""
+    header_vals = ws.get_values("1:1")
+    header = [h.strip() for h in header_vals[0]] if header_vals else []
+    if not header:
+        return
+    last = ws.row_count  # tahsisli satır sayısı (çoğu zaman yeter)
+    start = max(2, min(start_row, last))  # en az satır-2 (data başlangıcı)
+    # pencere uygula:
+    start = max(2, max(start, last - WINDOW + 1))
+    rng = f"{start}:{last}"
+    rows = ws.get_values(rng)  # sadece bu aralığı çek
+    for i, row in enumerate(rows, start=start):
+        rec = {header[j]: (row[j] if j < len(row) else "") for j in range(len(header))}
+        rec["_row"] = i
+        yield rec, header
 
 def route_once() -> Dict[str, int]:
     client = get_gspread_client()
@@ -59,10 +62,10 @@ def route_once() -> Dict[str, int]:
 
     src = open_sheet_by_id(client, src_id)
     dst = open_sheet_by_id(client, dst_id)
-
     ensure_person_list(dst)
 
     results: Dict[str,int] = {}
+
     for name in LOG_SHEETS:
         try:
             ws = src.worksheet(name)
@@ -71,10 +74,15 @@ def route_once() -> Dict[str, int]:
             continue
 
         pcol, rcol = ensure_processed_cols(ws)
-        records, hdr = get_all_records_with_row(ws)
-        done = 0
+        last_done = get_last_row(dst, name)
 
-        for rec in records:
+        processed = 0
+        max_row_seen = last_done
+
+        for rec, header in iter_rows(ws, last_done + 1):
+            max_row_seen = max(max_row_seen, rec["_row"])
+
+            # Zaten işlenmişse atla
             if str(rec.get("ProcessedAt","")).strip():
                 continue
 
@@ -83,22 +91,36 @@ def route_once() -> Dict[str, int]:
                 continue
 
             pid, durum = find_or_create_person(dst, kisi)
-
             if durum.lower().startswith("pasif"):
                 ws.update_cell(rec["_row"], pcol, now_str())
                 ws.update_cell(rec["_row"], rcol, "PASIF")
-                done += 1
+                processed += 1
                 continue
 
             pws = ensure_person_page(dst, pid)
             source_key = make_source_key(name, rec)
             zaman = pick_time(rec)
             raw = {k:v for k,v in rec.items() if k!="_row"}
-            append_to_person(pws, source_key, zaman, name.replace("Log",""), raw)
 
+            # Kişi sayfasına ekle
+            hdr = read_headers(pws)
+            row = [None]*len(hdr)
+            def setv(col, val):
+                if col in hdr: row[hdr.index(col)] = val
+            setv("Kaynak", name.replace("Log",""))
+            setv("SourceKey", source_key)
+            setv("Zaman", zaman)
+            setv("AlanlarJSON", json.dumps(raw, ensure_ascii=False))
+            setv("ProcessedAt", now_str())
+            pws.append_row(row, value_input_option="USER_ENTERED")
+
+            # Kaynak satırı işaretle
             ws.update_cell(rec["_row"], pcol, now_str())
             ws.update_cell(rec["_row"], rcol, pid)
-            done += 1
+            processed += 1
 
-        results[name] = done
+        # State'i güncelle
+        set_last_row(dst, name, max_row_seen)
+        results[name] = processed
+
     return results

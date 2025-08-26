@@ -70,3 +70,33 @@ def get_all_records_with_row(ws: gspread.Worksheet) -> Tuple[List[Dict], List[st
         rec["_row"] = i
         out.append(rec)
     return out, hdr
+    # --- EKLE: güvenli (retry’li) çağrılar ---
+import time, random
+from gspread.exceptions import APIError
+
+def _retry(fn, *args, **kwargs):
+    """429 (quota) geldiğinde exponential backoff ile yeniden dene."""
+    max_try = 5
+    for i in range(max_try):
+        try:
+            return fn(*args, **kwargs)
+        except APIError as e:
+            msg = str(e)
+            if "Quota exceeded" in msg or "429" in msg:
+                wait = (2 ** i) + random.uniform(0, 0.5)
+                print(f"[Retry] Quota 429, {i+1}/{max_try} bekle={wait:.2f}s")
+                time.sleep(wait)
+                continue
+            raise
+
+def safe_get_values(ws, rng):
+    return _retry(ws.get_values, rng)
+
+def safe_update(ws, rng, values):
+    return _retry(ws.update, rng, values)
+
+def safe_update_cell(ws, row, col, value):
+    return _retry(ws.update_cell, row, col, value)
+
+def safe_append_row(ws, row_vals):
+    return _retry(ws.append_row, row_vals, value_input_option="USER_ENTERED")

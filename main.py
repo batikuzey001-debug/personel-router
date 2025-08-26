@@ -1,4 +1,4 @@
-import os, time
+import os, time, traceback
 from router import route_once
 
 def main():
@@ -10,6 +10,7 @@ def main():
             print("Özet:", ", ".join(f"{k}:{v}" for k,v in res.items()))
         except Exception as e:
             print("HATA:", e)
+            traceback.print_exc()   # hata detayını göster
         time.sleep(interval)
 
 if __name__ == "__main__":
